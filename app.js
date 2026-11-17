@@ -277,7 +277,9 @@
     if (!window.jspdf) return toast('Library PDF gagal dimuat. Periksa koneksi internet.', true);
     const detail = $('pdfMode').value === 'detail';
     const { jsPDF } = window.jspdf;
-    const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+    const orientation = $('pdfOrient').value === 'portrait' ? 'portrait' : 'landscape';
+    const p = orientation === 'portrait';
+    const doc = new jsPDF({ orientation, unit: 'pt', format: 'a4' });
     const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight();
     const M = 40;
     const AMBER = [217, 119, 6], GREEN = [17, 122, 69];
@@ -295,7 +297,6 @@
     let y = 76;
     sorted.forEach((t, idx) => {
       const froms = [...new Set(t.groups.map((g) => g.from))];
-      const multiFrom = froms.length > 1;
       const badgeW = 34, lh = 12;
       const textX = M + 8 + badgeW + 8, textW = W - M - 8 - textX;
       doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5);
@@ -330,29 +331,30 @@
       destLines.forEach((l, i) => doc.text(l, textX, yy + i * lh));
       doc.setTextColor(20);
 
-      // Tabel
+      // Tabel. Kolom Lokasi Awal hanya muncul jika transaksi berasal dari lebih dari satu lokasi
+      const showFromCol = froms.length > 1;
       const uomTotals = {};
       let head, body, columnStyles, foot;
-      const fromCol = multiFrom ? [{ label: 'Lokasi Awal', w: 200 }] : [];
+      const fromCol = showFromCol ? [{ label: 'Lokasi Awal', w: 200 }] : [];
       if (detail) {
         head = [['No', 'Barcode / Lot', 'No. Container', 'Nama Motif', ...fromCol.map((c) => c.label), 'Qty Roll', 'Qty']];
         body = []; let n = 0;
         t.groups.forEach((g) => g.lots.forEach((lot, i) => {
           const q = g.qtys ? g.qtys[i] : (lotMap.get(lot) || {}).qty;
           if (q != null) uomTotals[g.uom] = (uomTotals[g.uom] || 0) + q;
-          body.push([String(++n), lot, g.container || '-', g.motif, ...(multiFrom ? [g.from] : []), '1', q != null ? `${fmtNum(q)} ${g.uom}` : '-']);
+          body.push([String(++n), lot, g.container || '-', g.motif, ...(showFromCol ? [g.from] : []), '1', q != null ? `${fmtNum(q)} ${g.uom}` : '-']);
         }));
         const qtyTotal = Object.entries(uomTotals).map(([u, v]) => `${fmtNum(v)} ${u}`).join(' + ') || '-';
-        foot = [['', '', '', 'Total', ...(multiFrom ? [''] : []), String(rollsOf(t)), qtyTotal]];
-        const k = multiFrom ? 1 : 0;
-        columnStyles = { 0: { cellWidth: 30 }, 1: { cellWidth: 100 }, 2: { cellWidth: 85 }, [4 + k]: { cellWidth: 50, halign: 'right' }, [5 + k]: { cellWidth: 85, halign: 'right' } };
-        if (multiFrom) columnStyles[4] = { cellWidth: 170 };
+        foot = [['', '', '', 'Total', ...(showFromCol ? [''] : []), String(rollsOf(t)), qtyTotal]];
+        const k = showFromCol ? 1 : 0;
+        columnStyles = { 0: { cellWidth: p ? 25 : 30 }, 1: { cellWidth: p ? 88 : 100 }, 2: { cellWidth: p ? 70 : 85 }, [4 + k]: { cellWidth: p ? 38 : 50, halign: 'right' }, [5 + k]: { cellWidth: p ? 62 : 85, halign: 'right' } };
+        if (showFromCol) columnStyles[4] = { cellWidth: p ? 130 : 170 };
       } else {
         head = [['No', 'No. Container', 'Nama Motif', ...fromCol.map((c) => c.label), 'Qty Roll']];
-        body = t.groups.map((g, i) => [String(i + 1), g.container || '-', g.motif, ...(multiFrom ? [g.from] : []), String(g.rolls)]);
-        foot = [['', '', 'Total Roll', ...(multiFrom ? [''] : []), String(rollsOf(t))]];
-        columnStyles = { 0: { cellWidth: 30 }, 1: { cellWidth: 110 }, [3 + (multiFrom ? 1 : 0)]: { cellWidth: 60, halign: 'right' } };
-        if (multiFrom) columnStyles[3] = { cellWidth: 230 };
+        body = t.groups.map((g, i) => [String(i + 1), g.container || '-', g.motif, ...(showFromCol ? [g.from] : []), String(g.rolls)]);
+        foot = [['', '', 'Total Roll', ...(showFromCol ? [''] : []), String(rollsOf(t))]];
+        columnStyles = { 0: { cellWidth: p ? 25 : 30 }, 1: { cellWidth: p ? 90 : 110 }, [3 + (showFromCol ? 1 : 0)]: { cellWidth: p ? 45 : 60, halign: 'right' } };
+        if (showFromCol) columnStyles[3] = { cellWidth: p ? 160 : 230 };
       }
       doc.autoTable({
         startY: y + headerH,
