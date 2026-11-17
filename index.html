@@ -88,10 +88,17 @@
         <label for="expDate">Tanggal</label>
         <input id="expDate" type="date">
       </div>
+      <div class="field inline">
+        <label for="pdfMode">Format PDF</label>
+        <select id="pdfMode">
+          <option value="ringkas">Ringkas (per motif &amp; container)</option>
+          <option value="detail">Detail (semua barcode / lot)</option>
+        </select>
+      </div>
       <button id="btnExport" class="btn btn-primary">Export PDF tanggal ini</button>
       <button id="btnExportAll" class="btn btn-outline">Export PDF semua riwayat</button>
     </div>
-    <p class="hint">Isi PDF: tanggal, nama motif, nomor container, qty roll, lokasi awal, tujuan baru, dan source dokumen.</p>
+    <p class="hint">Format berlaku untuk semua tombol export PDF. Header tiap transaksi memuat source dokumen, tanggal, lokasi awal (DARI) dan tujuan baru (KE). Mode Detail menampilkan setiap barcode beserta qty-nya.</p>
   </div>
 
   <div class="card">

@@ -18,7 +18,7 @@ main{max-width:1100px;margin:22px auto;padding:0 20px 60px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:16px}
 .hint{margin:0 0 10px;color:var(--muted);font-size:13px}
 .muted{color:var(--muted);font-size:13px}
-textarea,input[type=text],input[type=date],input[type=search]{width:100%;padding:10px 12px;border:1px solid #cfd6e0;border-radius:8px;font:inherit;background:#fff}
+textarea,select,input[type=text],input[type=date],input[type=search]{width:100%;padding:10px 12px;border:1px solid #cfd6e0;border-radius:8px;font:inherit;background:#fff}
 textarea{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical}
 textarea:focus,input:focus{outline:2px solid #bcd0ff;border-color:var(--brand)}
 .row{display:flex;align-items:center;margin-top:10px}

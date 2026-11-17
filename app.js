@@ -123,8 +123,8 @@
       const r = lotMap.get(lot);
       if (!r) { missing.push(lot); continue; }
       const key = [r.motif, r.container, r.loc].join('||');
-      if (!groups.has(key)) groups.set(key, { motif: r.motif, code: r.code, container: r.container, from: r.loc, uom: r.uom, rolls: 0, qty: 0, lots: [] });
-      const g = groups.get(key); g.rolls++; g.qty += r.qty; g.lots.push(lot);
+      if (!groups.has(key)) groups.set(key, { motif: r.motif, code: r.code, container: r.container, from: r.loc, uom: r.uom, rolls: 0, qty: 0, lots: [], qtys: [] });
+      const g = groups.get(key); g.rolls++; g.qty += r.qty; g.lots.push(lot); g.qtys.push(r.qty);
     }
     current = { groups: [...groups.values()].sort((a, b) => a.motif.localeCompare(b.motif) || a.container.localeCompare(b.container)), missing };
     renderResult();
@@ -210,7 +210,7 @@
 
     history.unshift({
       id: Date.now().toString(36), date: todayStr(), ts: Date.now(), dest: destVal, doc,
-      groups: current.groups.map((g) => ({ ...g, lots: [...g.lots] }))
+      groups: current.groups.map((g) => ({ ...g, lots: [...g.lots], qtys: [...g.qtys] }))
     });
     saveHistory();
     $('lotInput').value = ''; $('lotCount').textContent = '0 lot terdeteksi';
@@ -271,48 +271,96 @@
   });
 
   // ---------- Export PDF ----------
-  // Setiap transaksi dibuat sebagai blok tersendiri (header + tabel + total).
+  // Mode "ringkas": satu baris per motif+container. Mode "detail": satu baris per barcode/lot.
   function exportPDF(txs, subtitle, filename) {
     if (!txs.length) return toast('Tidak ada transaksi untuk diexport.', true);
     if (!window.jspdf) return toast('Library PDF gagal dimuat. Periksa koneksi internet.', true);
+    const detail = $('pdfMode').value === 'detail';
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
     const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight();
-    const M = 40, BLOCK_MIN = 130; // sisa ruang minimum sebelum pindah halaman
+    const M = 40;
+    const AMBER = [217, 119, 6], GREEN = [17, 122, 69];
 
     const sorted = [...txs].sort((a, b) => a.ts - b.ts);
-    const grandRolls = sorted.reduce((s, t) => s + t.groups.reduce((x, g) => x + g.rolls, 0), 0);
+    const rollsOf = (t) => t.groups.reduce((s, g) => s + g.rolls, 0);
+    const grandRolls = sorted.reduce((s, t) => s + rollsOf(t), 0);
 
-    doc.setFont('helvetica', 'bold'); doc.setFontSize(15);
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.setTextColor(20);
     doc.text('Laporan Perpindahan Barang', M, 40);
     doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
-    doc.text(`${subtitle}  |  ${sorted.length} transaksi  |  ${grandRolls} roll`, M, 57);
+    doc.text(`${subtitle}  |  ${detail ? 'Detail semua lot' : 'Ringkas'}  |  ${sorted.length} transaksi  |  ${grandRolls} roll`, M, 57);
     doc.text('Dicetak: ' + new Date().toLocaleString('id-ID'), W - M, 40, { align: 'right' });
 
     let y = 76;
     sorted.forEach((t, idx) => {
-      if (y + BLOCK_MIN > H - 40) { doc.addPage(); y = 40; }
-
-      // Header blok transaksi
-      doc.setFillColor(232, 238, 252); doc.setDrawColor(31, 94, 255);
-      doc.rect(M, y, W - 2 * M, 42, 'FD');
-      doc.setFont('helvetica', 'bold'); doc.setFontSize(11); doc.setTextColor(20);
-      doc.text(`Transaksi ${idx + 1}  -  Source Dokumen: ${t.doc}`, M + 8, y + 16);
+      const froms = [...new Set(t.groups.map((g) => g.from))];
+      const multiFrom = froms.length > 1;
+      const badgeW = 34, lh = 12;
+      const textX = M + 8 + badgeW + 8, textW = W - M - 8 - textX;
       doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5);
-      const time = new Date(t.ts).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
-      doc.text(`Tanggal: ${fmtDate(t.date)} ${time}`, M + 8, y + 32);
-      doc.text(`Tujuan Lokasi Baru: ${t.dest}`, M + 190, y + 32);
+      const fromLines = froms.flatMap((f) => doc.splitTextToSize(f, textW));
+      doc.setFont('helvetica', 'bold');
+      const destLines = doc.splitTextToSize(t.dest, textW);
+      const headerH = 14 + 16 + fromLines.length * lh + 8 + destLines.length * lh + 8;
 
-      const rolls = t.groups.reduce((s, g) => s + g.rolls, 0);
+      if (y + headerH + 60 > H - 40) { doc.addPage(); y = 40; }
+
+      // Kotak header transaksi
+      doc.setFillColor(243, 246, 252); doc.setDrawColor(190, 200, 220);
+      doc.rect(M, y, W - 2 * M, headerH, 'FD');
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(11); doc.setTextColor(20);
+      doc.text(`Transaksi ${idx + 1}  -  Source Dokumen: ${t.doc}`, M + 8, y + 17);
+      const time = new Date(t.ts).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5);
+      doc.text(`Tanggal: ${fmtDate(t.date)} ${time}`, W - M - 8, y + 17, { align: 'right' });
+
+      const badge = (label, color, by) => {
+        doc.setFillColor(...color); doc.rect(M + 8, by - 9, badgeW, 13, 'F');
+        doc.setTextColor(255); doc.setFont('helvetica', 'bold'); doc.setFontSize(7.5);
+        doc.text(label, M + 8 + badgeW / 2, by + 0.5, { align: 'center' });
+      };
+      let yy = y + 36;
+      badge('DARI', AMBER, yy);
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); doc.setTextColor(110, 60, 5);
+      fromLines.forEach((l, i) => doc.text(l, textX, yy + i * lh));
+      yy += fromLines.length * lh + 8;
+      badge('KE', GREEN, yy);
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(9.5); doc.setTextColor(10, 90, 50);
+      destLines.forEach((l, i) => doc.text(l, textX, yy + i * lh));
+      doc.setTextColor(20);
+
+      // Tabel
+      const uomTotals = {};
+      let head, body, columnStyles, foot;
+      const fromCol = multiFrom ? [{ label: 'Lokasi Awal', w: 200 }] : [];
+      if (detail) {
+        head = [['No', 'Barcode / Lot', 'No. Container', 'Nama Motif', ...fromCol.map((c) => c.label), 'Qty Roll', 'Qty']];
+        body = []; let n = 0;
+        t.groups.forEach((g) => g.lots.forEach((lot, i) => {
+          const q = g.qtys ? g.qtys[i] : (lotMap.get(lot) || {}).qty;
+          if (q != null) uomTotals[g.uom] = (uomTotals[g.uom] || 0) + q;
+          body.push([String(++n), lot, g.container || '-', g.motif, ...(multiFrom ? [g.from] : []), '1', q != null ? `${fmtNum(q)} ${g.uom}` : '-']);
+        }));
+        const qtyTotal = Object.entries(uomTotals).map(([u, v]) => `${fmtNum(v)} ${u}`).join(' + ') || '-';
+        foot = [['', '', '', 'Total', ...(multiFrom ? [''] : []), String(rollsOf(t)), qtyTotal]];
+        const k = multiFrom ? 1 : 0;
+        columnStyles = { 0: { cellWidth: 30 }, 1: { cellWidth: 100 }, 2: { cellWidth: 85 }, [4 + k]: { cellWidth: 50, halign: 'right' }, [5 + k]: { cellWidth: 85, halign: 'right' } };
+        if (multiFrom) columnStyles[4] = { cellWidth: 170 };
+      } else {
+        head = [['No', 'No. Container', 'Nama Motif', ...fromCol.map((c) => c.label), 'Qty Roll']];
+        body = t.groups.map((g, i) => [String(i + 1), g.container || '-', g.motif, ...(multiFrom ? [g.from] : []), String(g.rolls)]);
+        foot = [['', '', 'Total Roll', ...(multiFrom ? [''] : []), String(rollsOf(t))]];
+        columnStyles = { 0: { cellWidth: 30 }, 1: { cellWidth: 110 }, [3 + (multiFrom ? 1 : 0)]: { cellWidth: 60, halign: 'right' } };
+        if (multiFrom) columnStyles[3] = { cellWidth: 230 };
+      }
       doc.autoTable({
-        startY: y + 42,
-        head: [['No', 'Nama Motif', 'No. Container', 'Lokasi Awal', 'Qty Roll']],
-        body: t.groups.map((g, i) => [String(i + 1), g.motif, g.container || '-', g.from, String(g.rolls)]),
-        foot: [['', '', '', 'Total Roll', String(rolls)]],
-        styles: { fontSize: 8.5, cellPadding: 4, overflow: 'linebreak' },
+        startY: y + headerH,
+        head, body, foot,
+        styles: { fontSize: detail ? 8 : 8.5, cellPadding: detail ? 3 : 4, overflow: 'linebreak' },
         headStyles: { fillColor: [31, 94, 255] },
         footStyles: { fillColor: [245, 247, 251], textColor: 20, fontStyle: 'bold' },
-        columnStyles: { 0: { cellWidth: 30 }, 2: { cellWidth: 90 }, 3: { cellWidth: 250 }, 4: { cellWidth: 55, halign: 'right' } },
+        columnStyles,
         margin: { left: M, right: M, top: 40, bottom: 40 },
         showFoot: 'lastPage',
         rowPageBreak: 'avoid'
@@ -322,7 +370,7 @@
 
     const pages = doc.internal.getNumberOfPages();
     for (let p = 1; p <= pages; p++) {
-      doc.setPage(p); doc.setFontSize(8); doc.setTextColor(110);
+      doc.setPage(p); doc.setFontSize(8); doc.setTextColor(110); doc.setFont('helvetica', 'normal');
       doc.text(`Halaman ${p} / ${pages}`, W / 2, H - 18, { align: 'center' });
     }
     doc.save(filename + '.pdf');
