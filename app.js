@@ -15,207 +15,191 @@
   function toast(msg, isErr) {
     const t = $('toast');
     t.textContent = msg; t.className = 'toast' + (isErr ? ' err' : ''); t.hidden = false;
-    clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.hidden = true), 3500);
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.hidden = true), 4000);
   }
 
-  // ---------- Penyimpanan ----------
-  // Data stok (besar, 20rb+ baris) -> IndexedDB. Riwayat transaksi -> localStorage.
-  const DB_NAME = 'wms-move', STORE = 'kv';
-  function idb() {
-    return new Promise((res, rej) => {
-      const r = indexedDB.open(DB_NAME, 1);
-      r.onupgradeneeded = () => r.result.createObjectStore(STORE);
-      r.onsuccess = () => res(r.result);
-      r.onerror = () => rej(r.error);
-    });
-  }
-  async function idbGet(key) {
-    const db = await idb();
-    return new Promise((res, rej) => { const q = db.transaction(STORE).objectStore(STORE).get(key); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
-  }
-  async function idbSet(key, val) {
-    const db = await idb();
-    return new Promise((res, rej) => { const tx = db.transaction(STORE, 'readwrite'); tx.objectStore(STORE).put(val, key); tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
-  }
+  // ---------- Penyimpanan riwayat (localStorage) ----------
   const HIST_KEY = 'wms_move_history_v1';
   const loadHistory = () => { try { return JSON.parse(localStorage.getItem(HIST_KEY)) || []; } catch { return []; } };
   const saveHistory = () => localStorage.setItem(HIST_KEY, JSON.stringify(history));
 
   // ---------- State ----------
-  let stock = [];            // [{lot, code, motif, container, loc, qty, uom}]
-  let lotMap = new Map();    // lot -> row
-  let locations = [];        // daftar lokasi unik
-  let stockMeta = null;      // {name, count, at}
   let history = loadHistory();
-  let current = null;        // hasil generate {groups, missing}
-  let selectedDest = '';
+  let pending = [];          // transaksi hasil baca PDF, belum disimpan
   const selected = new Set(); // id transaksi yang dipilih untuk export
 
-  // ---------- Upload & parse Excel ----------
-  const COLS = {
-    lot: 'Lot/Serial Number', code: 'Product Code', motif: 'Product/Name', container: 'Nomor Container',
-    loc: 'Location', qty: 'Quantity', uom: 'Unit of Measure'
-  };
-  function indexStock(rows) {
-    stock = rows;
-    lotMap = new Map(rows.map((r) => [r.lot, r]));
-    locations = [...new Set(rows.map((r) => r.loc).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  // ---------- Baca PDF "Location Transfer" ----------
+  const PDFJS_WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  const DOC_RE = /^[A-Za-z]{2,}\/[A-Za-z]+\/{1,2}[\w/.\-]+$/;          // contoh: GDA/INT//26/11/17/47860
+  const DATE_RE = /(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/; // MM/DD/YYYY HH:MM:SS
+  // Batas kolom tabel sebagai pecahan lebar halaman: [produk, lot, container, source, destination, done, uom]
+  const COL = [0.092, 0.225, 0.362, 0.470, 0.616, 0.798, 0.867];
+
+  function lineJoin(items) {
+    // gabungkan item teks per baris visual (atas ke bawah, kiri ke kanan)
+    const s = [...items].sort((a, b) => b.y - a.y || a.x - b.x);
+    const lines = [];
+    for (const it of s) {
+      const last = lines[lines.length - 1];
+      if (last && Math.abs(last.y - it.y) <= 2.5) last.items.push(it); else lines.push({ y: it.y, items: [it] });
+    }
+    return lines.map((l) => l.items.sort((a, b) => a.x - b.x).map((i) => i.s).join(' ')).join(' ').replace(/\s+/g, ' ').trim();
   }
-  function renderStatus() {
-    const el = $('dataStatus');
-    if (stockMeta) {
-      el.className = 'chip chip-ok';
-      el.textContent = `${stockMeta.name} · ${stockMeta.count.toLocaleString('id-ID')} lot · ${locations.length} lokasi`;
-    } else { el.className = 'chip chip-warn'; el.textContent = 'Belum ada data stok'; }
-  }
-  $('fileInput').addEventListener('change', async (e) => {
-    const f = e.target.files[0]; if (!f) return;
-    try {
-      if (typeof XLSX === 'undefined') throw new Error('Library Excel gagal dimuat. Periksa koneksi internet.');
-      toast('Membaca file...');
-      const wb = XLSX.read(await f.arrayBuffer(), { type: 'array', cellDates: true });
-      const json = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '', raw: true });
-      if (!json.length) throw new Error('File kosong.');
-      const missingCols = Object.values(COLS).filter((c) => !(c in json[0]));
-      if (missingCols.length) throw new Error('Kolom tidak ditemukan: ' + missingCols.join(', '));
-      const rows = [];
-      for (const r of json) {
-        const lot = String(r[COLS.lot]).trim();
-        if (!lot) continue;
-        rows.push({
-          lot, code: String(r[COLS.code]).trim(), motif: String(r[COLS.motif]).trim(),
-          container: String(r[COLS.container]).trim(), loc: String(r[COLS.loc]).trim(),
-          qty: Number(r[COLS.qty]) || 0, uom: String(r[COLS.uom]).trim()
-        });
+
+  async function parsePdf(file) {
+    const pdfjs = window.pdfjsLib;
+    if (!pdfjs) throw new Error('Library PDF gagal dimuat. Periksa koneksi internet.');
+    pdfjs.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
+    const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+
+    const info = { doc: '', dt: null, by: '', total: null };
+    const rows = []; let failed = 0;
+
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const W = page.getViewport({ scale: 1 }).width;
+      const tc = await page.getTextContent();
+      const items = tc.items.filter((i) => i.str.trim()).map((i) => ({ s: i.str.trim(), x: i.transform[4], y: i.transform[5] }));
+
+      if (p === 1) {
+        const strs = tc.items.map((i) => i.str.trim()).filter(Boolean);
+        info.doc = strs.find((s) => DOC_RE.test(s)) || '';
+        info.dt = (strs.map((s) => s.match(DATE_RE)).find(Boolean)) || null;
+        const bi = strs.indexOf('Created By'); if (bi >= 0) info.by = strs[bi + 1] || '';
+        const ti = strs.indexOf('Total Qty');
+        if (ti >= 0) { const v = strs.slice(ti + 1, ti + 3).find((s) => /^[\d,]+(\.\d+)?$/.test(s)); if (v) info.total = parseFloat(v.replace(/,/g, '')); }
       }
-      indexStock(rows);
-      stockMeta = { name: f.name, count: rows.length, at: Date.now() };
-      await idbSet('stock', { rows, meta: stockMeta });
-      renderStatus(); resetResult();
-      toast(`Berhasil: ${rows.length.toLocaleString('id-ID')} lot dimuat.`);
-    } catch (err) { toast(err.message || 'Gagal membaca file', true); }
-    e.target.value = '';
-  });
 
-  // ---------- Parse lot ----------
-  function parseLots(text) {
-    return [...new Set(text.split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean))];
-  }
-  $('lotInput').addEventListener('input', () => {
-    const n = parseLots($('lotInput').value).length;
-    $('lotCount').textContent = `${n} lot terdeteksi`;
-  });
-  $('btnClear').addEventListener('click', () => { $('lotInput').value = ''; $('lotCount').textContent = '0 lot terdeteksi'; resetResult(); });
-
-  // ---------- Generate ----------
-  function resetResult() {
-    current = null; selectedDest = '';
-    $('resultCard').hidden = true; $('saveCard').hidden = true;
-    $('destInput').value = ''; $('docInput').value = '';
-  }
-  $('btnGenerate').addEventListener('click', () => {
-    if (!stock.length) return toast('Upload file stok terlebih dahulu.', true);
-    const lots = parseLots($('lotInput').value);
-    if (!lots.length) return toast('Masukkan minimal satu lot / serial number.', true);
-
-    const groups = new Map(); const missing = [];
-    for (const lot of lots) {
-      const r = lotMap.get(lot);
-      if (!r) { missing.push(lot); continue; }
-      const key = [r.motif, r.container, r.loc].join('||');
-      if (!groups.has(key)) groups.set(key, { motif: r.motif, code: r.code, container: r.container, from: r.loc, uom: r.uom, rolls: 0, qty: 0, lots: [], qtys: [] });
-      const g = groups.get(key); g.rolls++; g.qty += r.qty; g.lots.push(lot); g.qtys.push(r.qty);
+      // baris tabel dimulai dari angka pada kolom "No."
+      const nums = items.filter((i) => /^\d+$/.test(i.s) && i.x < COL[0] * W && i.y > 60).sort((a, b) => b.y - a.y);
+      if (!nums.length) continue;
+      const ys = nums.map((n) => n.y);
+      const buckets = nums.map(() => []);
+      for (const it of items) {
+        if (it.y < 60 || it.y > ys[0] + 8) continue; // buang footer & kepala halaman
+        let idx = -1;
+        for (let i = 0; i < ys.length; i++) if (it.y <= ys[i] + 8) idx = i;
+        if (idx >= 0) buckets[idx].push(it);
+      }
+      buckets.forEach((b) => {
+        const col = (lo, hi) => lineJoin(b.filter((i) => i.x >= lo * W && i.x < hi * W));
+        const product = col(COL[0], COL[1]);
+        const lot = col(COL[1], COL[2]).replace(/\s+/g, '');
+        const container = col(COL[2], COL[3]);
+        const from = col(COL[3], COL[4]);
+        const dest = col(COL[4], COL[5]);
+        const done = col(COL[5], COL[6]);
+        const uom = col(COL[6], 2);
+        const pm = product.match(/^\[([^\]]+)\]\s*(.*)$/);
+        const code = pm ? pm[1] : '';
+        const motif = (pm ? pm[2] : product).replace(/\s*\(.*$/, '').trim();
+        const qty = parseFloat(done.replace(/,/g, ''));
+        if (!lot || !from || !dest || !motif || Number.isNaN(qty)) { failed++; return; }
+        rows.push({ lot, code, motif, container, from, dest, qty, uom });
+      });
     }
-    current = { groups: [...groups.values()].sort((a, b) => a.motif.localeCompare(b.motif) || a.container.localeCompare(b.container)), missing };
-    renderResult();
-  });
-
-  function renderResult() {
-    const { groups, missing } = current;
-    $('resultCard').hidden = false;
-    $('saveCard').hidden = !groups.length;
-    const mb = $('missingBox');
-    if (missing.length) {
-      mb.hidden = false;
-      mb.innerHTML = `<b>${missing.length} lot tidak ditemukan</b> di data stok dan tidak akan disimpan:<div class="lotchips">${missing.map((l) => `<span>${esc(l)}</span>`).join('')}</div>`;
-    } else mb.hidden = true;
-
-    const body = $('resultTable').querySelector('tbody');
-    body.innerHTML = groups.length ? groups.map((g) => `
-      <tr>
-        <td><b>${esc(g.motif)}</b><div class="muted">${esc(g.code)}</div>
-          <details><summary>Lihat ${g.lots.length} lot</summary><div class="lots">${g.lots.map(esc).join(', ')}</div></details></td>
-        <td>${esc(g.container) || '-'}</td>
-        <td>${esc(g.from)}</td>
-        <td class="num">${g.rolls}</td>
-        <td class="num">${fmtNum(g.qty)} ${esc(g.uom)}</td>
-      </tr>`).join('') : '<tr><td colspan="5" class="empty">Tidak ada lot yang cocok.</td></tr>';
-
-    const totalRolls = groups.reduce((s, g) => s + g.rolls, 0);
-    $('resultTable').querySelector('tfoot').innerHTML = groups.length ?
-      `<tr><td colspan="3">Total</td><td class="num">${totalRolls}</td><td></td></tr>` : '';
+    return { info, rows, failed };
   }
 
-  // ---------- Combobox lokasi tujuan ----------
-  const dest = $('destInput'), list = $('destList');
-  let activeIdx = -1, shown = [];
-  function renderCombo() {
-    const q = dest.value.trim().toLowerCase();
-    const terms = q.split(/\s+/).filter(Boolean);
-    const all = terms.length ? locations.filter((l) => { const x = l.toLowerCase(); return terms.every((t) => x.includes(t)); }) : locations;
-    shown = all.slice(0, 60); activeIdx = -1;
-    if (!shown.length) { list.hidden = true; return; }
-    else {
-      const hl = (l) => { let h = esc(l); terms.forEach((t) => { h = h.replace(new RegExp('(' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'ig'), '<mark>$1</mark>'); }); return h; };
-      list.innerHTML = shown.map((l, i) => `<div class="combo-item" data-i="${i}">${terms.length ? hl(l) : esc(l)}</div>`).join('') +
-        (all.length > shown.length ? `<div class="combo-empty">+${all.length - shown.length} lokasi lain, persempit pencarian...</div>` : '');
+  // ubah hasil baca PDF -> daftar transaksi (satu per tujuan)
+  function buildTransactions(file, parsed) {
+    const { info, rows, failed } = parsed;
+    const warnings = [];
+    let doc = info.doc;
+    if (!doc) { doc = file.name.replace(/\.pdf$/i, ''); warnings.push('Nomor dokumen tidak terbaca, memakai nama file.'); }
+    let date = todayStr(), ts = Date.now();
+    if (info.dt) {
+      const [, mo, d, y, h, mi, se] = info.dt;
+      date = `${y}-${mo}-${d}`; ts = new Date(+y, +mo - 1, +d, +h, +mi, +se).getTime();
+    } else warnings.push('Tanggal transfer tidak terbaca, memakai tanggal hari ini.');
+    if (failed) warnings.push(`${failed} baris tidak bisa dibaca dan dilewati.`);
+    const sum = rows.reduce((s, r) => s + r.qty, 0);
+    if (info.total != null && Math.abs(sum - info.total) > 0.01) {
+      warnings.push(`Total Qty di dokumen (${fmtNum(info.total)}) tidak sama dengan jumlah baris terbaca (${fmtNum(sum)}). Periksa hasilnya.`);
     }
-    list.hidden = false;
-  }
-  function pick(i) {
-    if (i < 0 || !shown[i]) return;
-    selectedDest = shown[i]; dest.value = selectedDest; list.hidden = true;
-   
-  }
-  function moveActive(d) {
-    const items = list.querySelectorAll('.combo-item'); if (!items.length) return;
-    items[activeIdx]?.classList.remove('active');
-    activeIdx = activeIdx < 0 ? (d > 0 ? 0 : items.length - 1) : (activeIdx + d + items.length) % items.length;
-    items[activeIdx].classList.add('active'); items[activeIdx].scrollIntoView({ block: 'nearest' });
-  }
-  dest.addEventListener('focus', () => { if (locations.length) renderCombo(); });
-  dest.addEventListener('input', () => { selectedDest = ''; renderCombo(); });
-  dest.addEventListener('keydown', (e) => {
-    if (e.key === 'ArrowDown') { e.preventDefault(); list.hidden ? renderCombo() : moveActive(1); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); moveActive(-1); }
-    else if (e.key === 'Enter') { if (!list.hidden && activeIdx >= 0) { e.preventDefault(); pick(activeIdx); } }
-    else if (e.key === 'Escape') list.hidden = true;
-  });
-  list.addEventListener('mousedown', (e) => { const it = e.target.closest('.combo-item'); if (it) { e.preventDefault(); pick(+it.dataset.i); } });
-  document.addEventListener('click', (e) => { if (!e.target.closest('.combo')) list.hidden = true; });
-  dest.addEventListener('blur', () => setTimeout(() => (list.hidden = true), 120));
 
-  // ---------- Simpan ----------
+    const byDest = new Map();
+    for (const r of rows) { if (!byDest.has(r.dest)) byDest.set(r.dest, []); byDest.get(r.dest).push(r); }
+    return [...byDest.entries()].map(([dest, rs]) => {
+      const groups = new Map();
+      for (const r of rs) {
+        const key = [r.motif, r.container, r.from].join('||');
+        if (!groups.has(key)) groups.set(key, { motif: r.motif, code: r.code, container: r.container, from: r.from, uom: r.uom, rolls: 0, qty: 0, lots: [], qtys: [] });
+        const g = groups.get(key); g.rolls++; g.qty += r.qty; g.lots.push(r.lot); g.qtys.push(r.qty);
+      }
+      return {
+        id: '', date, ts, dest, doc, by: info.by,
+        groups: [...groups.values()].sort((a, b) => a.motif.localeCompare(b.motif) || a.container.localeCompare(b.container)),
+        warnings, file: file.name
+      };
+    });
+  }
+
+  async function handleFiles(fileList) {
+    const files = [...fileList].filter((f) => /\.pdf$/i.test(f.name) || f.type === 'application/pdf');
+    if (!files.length) return toast('Pilih file PDF Location Transfer.', true);
+    $('parseStatus').textContent = 'Membaca file...';
+    const out = []; const errs = [];
+    for (const f of files) {
+      try {
+        const parsed = await parsePdf(f);
+        if (!parsed.rows.length) { errs.push(`${f.name}: tidak ada baris barang yang terbaca. Pastikan ini PDF "Location Transfer".`); continue; }
+        out.push(...buildTransactions(f, parsed));
+      } catch (e) { errs.push(`${f.name}: ${e.message || 'gagal dibaca'}`); }
+    }
+    $('parseStatus').textContent = '';
+    if (errs.length) toast(errs.join(' | '), true);
+    if (out.length) { pending = out; renderPending(); }
+  }
+
+  function renderPending() {
+    const card = $('pendingCard');
+    card.hidden = !pending.length;
+    if (!pending.length) return;
+    const totalRolls = pending.reduce((s, t) => s + t.groups.reduce((x, g) => x + g.rolls, 0), 0);
+    $('pendingSummary').textContent = `${pending.length} transaksi siap disimpan, ${totalRolls} roll`;
+    $('pendingList').innerHTML = pending.map((t) => {
+      const rolls = t.groups.reduce((s, g) => s + g.rolls, 0);
+      const qty = {}; t.groups.forEach((g) => { qty[g.uom] = (qty[g.uom] || 0) + g.qty; });
+      const qtyTxt = Object.entries(qty).map(([u, v]) => `${fmtNum(v)} ${u}`).join(' + ');
+      const froms = [...new Set(t.groups.map((g) => g.from))];
+      return `<div class="tx">
+        <div class="tx-head">
+          <div><b>${esc(t.doc)}</b> <span class="tx-meta">· ${fmtDate(t.date)} ${new Date(t.ts).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}${t.by ? ' · ' + esc(t.by) : ''} · ${rolls} roll · ${qtyTxt}</span></div>
+        </div>
+        <div class="route">
+          <div><span class="tag tag-from">DARI</span> ${froms.map(esc).join('<br>')}</div>
+          <div><span class="tag tag-to">KE</span> <b>${esc(t.dest)}</b></div>
+        </div>
+        ${t.warnings.length ? `<div class="alert alert-warn">${t.warnings.map(esc).join('<br>')}</div>` : ''}
+        <div class="table-wrap"><table>
+          <thead><tr><th>Nama Motif</th><th>No. Container</th><th>Lokasi Awal</th><th class="num">Qty Roll</th><th class="num">Total Qty</th></tr></thead>
+          <tbody>${t.groups.map((g) => `<tr><td><b>${esc(g.motif)}</b><div class="muted">${esc(g.code)}</div><details><summary>Lihat ${g.lots.length} lot</summary><div class="lots">${g.lots.map(esc).join(', ')}</div></details></td><td>${esc(g.container) || '-'}</td><td>${esc(g.from)}</td><td class="num">${g.rolls}</td><td class="num">${fmtNum(g.qty)} ${esc(g.uom)}</td></tr>`).join('')}</tbody>
+          <tfoot><tr><td colspan="3">Total</td><td class="num">${rolls}</td><td class="num">${qtyTxt}</td></tr></tfoot>
+        </table></div></div>`;
+    }).join('');
+  }
+
+  // upload: pilih file / drag & drop
+  $('fileInput').addEventListener('change', (e) => { handleFiles(e.target.files); e.target.value = ''; });
+  const dz = $('dropzone');
+  ['dragenter', 'dragover'].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('over'); }));
+  dz.addEventListener('drop', (e) => handleFiles(e.dataTransfer.files));
+
+  $('btnCancel').addEventListener('click', () => { pending = []; renderPending(); });
   $('btnSave').addEventListener('click', () => {
-    if (!current || !current.groups.length) return toast('Belum ada hasil generate.', true);
-    const destVal = dest.value.trim();
-    if (!destVal) return toast('Isi tujuan lokasi.', true);
-    const doc = $('docInput').value.trim();
-    if (!doc) return toast('Isi source dokumen transaksi.', true);
-
-    const lotsNow = current.groups.flatMap((g) => g.lots);
-    const used = new Set(history.flatMap((t) => t.groups.flatMap((g) => g.lots)));
-    const dupes = lotsNow.filter((l) => used.has(l));
-    if (dupes.length && !confirm(`${dupes.length} lot sudah pernah masuk transaksi sebelumnya. Tetap simpan?`)) return;
-
-    history.unshift({
-      id: Date.now().toString(36), date: todayStr(), ts: Date.now(), dest: destVal, doc,
-      groups: current.groups.map((g) => ({ ...g, lots: [...g.lots], qtys: [...g.qtys] }))
+    if (!pending.length) return;
+    const dup = [...new Set(pending.map((t) => t.doc).filter((d) => history.some((h) => h.doc === d)))];
+    if (dup.length && !confirm(`Dokumen ${dup.join(', ')} sudah pernah disimpan. Tetap simpan lagi?`)) return;
+    const base = Date.now();
+    pending.slice().reverse().forEach((t, i) => {
+      const { warnings, file, ...rec } = t;
+      history.unshift({ ...rec, id: (base + i).toString(36) + Math.random().toString(36).slice(2, 5) });
     });
     saveHistory();
-    $('lotInput').value = ''; $('lotCount').textContent = '0 lot terdeteksi';
-    resetResult(); renderHistory();
-    toast('Transaksi tersimpan.');
+    const n = pending.length; pending = []; renderPending(); renderHistory();
+    toast(`${n} transaksi tersimpan.`);
   });
 
   // ---------- Riwayat ----------
@@ -340,7 +324,7 @@
         head = [['No', 'Barcode / Lot', 'No. Container', 'Nama Motif', ...fromCol.map((c) => c.label), 'Qty Roll', 'Qty']];
         body = []; let n = 0;
         t.groups.forEach((g) => g.lots.forEach((lot, i) => {
-          const q = g.qtys ? g.qtys[i] : (lotMap.get(lot) || {}).qty;
+          const q = g.qtys ? g.qtys[i] : undefined;
           if (q != null) uomTotals[g.uom] = (uomTotals[g.uom] || 0) + q;
           body.push([String(++n), lot, g.container || '-', g.motif, ...(showFromCol ? [g.from] : []), '1', q != null ? `${fmtNum(q)} ${g.uom}` : '-']);
         }));
@@ -392,12 +376,6 @@
   }));
 
   // ---------- Init ----------
-  (async () => {
-    $('expDate').value = todayStr();
-    try {
-      const saved = await idbGet('stock');
-      if (saved && saved.rows) { indexStock(saved.rows); stockMeta = saved.meta; }
-    } catch (e) { console.warn(e); }
-    renderStatus(); renderHistory();
-  })();
+  $('expDate').value = todayStr();
+  renderHistory();
 })();

@@ -66,3 +66,10 @@ details summary{cursor:pointer;color:var(--brand);font-size:12.5px;margin-top:4p
 .chk-box,.chk input,#selAll{width:17px;height:17px;cursor:pointer;accent-color:var(--brand)}
 .tx-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .btn:disabled{opacity:.45;cursor:not-allowed}
+.dropzone{display:flex;flex-direction:column;align-items:center;gap:4px;padding:34px 16px;border:2px dashed #b9c6e0;border-radius:12px;background:#f8faff;cursor:pointer;color:var(--ink);text-align:center}
+.dropzone span{color:var(--muted);font-size:13px}
+.dropzone:hover,.dropzone.over{background:#eef3ff;border-color:var(--brand)}
+.route{display:grid;gap:6px;padding:10px 14px;font-size:13.5px}
+.tag{display:inline-block;min-width:38px;text-align:center;padding:1px 6px;border-radius:4px;color:#fff;font-size:11px;font-weight:700;margin-right:6px;vertical-align:1px}
+.tag-from{background:#d97706}.tag-to{background:#117a45}
+.tx .alert{margin:0 14px 8px}
